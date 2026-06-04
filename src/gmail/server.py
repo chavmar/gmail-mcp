@@ -4,8 +4,13 @@ import os
 import asyncio
 import logging
 import base64
+import mimetypes
+from pathlib import Path
+from email import policy
 from email.message import EmailMessage
 from email.header import decode_header
+from email.parser import BytesParser
+from email.utils import formataddr, getaddresses, parseaddr
 from base64 import urlsafe_b64decode
 from email import message_from_bytes
 import webbrowser
@@ -32,10 +37,14 @@ You can draft, edit, read, trash, open, and send emails.
 You've been given access to a specific gmail account. 
 You have the following tools available:
 - Send an email (send-email)
+- Reply to an email thread (reply-to-email)
 - Create a draft email (create-draft)
 - List draft emails (list-drafts)
+- Attach files to an existing draft (attach-files-to-draft)
 - Retrieve unread emails (get-unread-emails)
 - Read email content (read-email)
+- List email attachments (list-email-attachments)
+- Read email attachments (read-email-attachments)
 - Trash email (trash-email)
 - Open email in browser (open-email)
 - List all labels (list-labels)
@@ -233,8 +242,91 @@ class GmailService:
         profile = self.service.users().getProfile(userId='me').execute()
         user_email = profile.get('emailAddress', '')
         return user_email
+
+    @staticmethod
+    def _decode_base64url(data: str) -> bytes:
+        """Decode Gmail's unpadded base64url payloads."""
+        return urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+    @staticmethod
+    def _encode_message(message_obj: EmailMessage) -> str:
+        return base64.urlsafe_b64encode(message_obj.as_bytes()).decode()
+
+    @staticmethod
+    def _header_lookup(headers: list[dict]) -> dict[str, str]:
+        return {
+            header.get('name', '').lower(): header.get('value', '')
+            for header in headers
+        }
+
+    @staticmethod
+    def _format_unique_addresses(addresses: list[tuple[str, str]]) -> list[str]:
+        seen = set()
+        formatted = []
+        for name, email in addresses:
+            email = email.strip()
+            if not email:
+                continue
+            key = email.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            formatted.append(formataddr((name, email)) if name else email)
+        return formatted
+
+    @staticmethod
+    def _attachment_paths(attachment_paths: list[str] | str | None) -> list[Path]:
+        if not attachment_paths:
+            return []
+        if isinstance(attachment_paths, str):
+            attachment_paths = [attachment_paths]
+
+        paths = []
+        for attachment_path in attachment_paths:
+            path = Path(attachment_path).expanduser()
+            if not path.is_file():
+                raise FileNotFoundError(f"Attachment not found: {attachment_path}")
+            paths.append(path)
+        return paths
+
+    def _add_attachments(self, message_obj: EmailMessage, attachment_paths: list[str] | str | None) -> None:
+        for path in self._attachment_paths(attachment_paths):
+            mime_type, _ = mimetypes.guess_type(path.name)
+            maintype, subtype = (mime_type or "application/octet-stream").split("/", 1)
+            message_obj.add_attachment(
+                path.read_bytes(),
+                maintype=maintype,
+                subtype=subtype,
+                filename=path.name,
+            )
+
+    @staticmethod
+    def _attachment_parts(payload: dict) -> list[dict]:
+        attachments = []
+
+        def walk(part: dict) -> None:
+            body = part.get('body', {})
+            attachment_id = body.get('attachmentId')
+            filename = part.get('filename', '')
+            if attachment_id:
+                headers = GmailService._header_lookup(part.get('headers', []))
+                attachments.append({
+                    'attachment_id': attachment_id,
+                    'part_id': part.get('partId'),
+                    'filename': filename,
+                    'mime_type': part.get('mimeType', 'application/octet-stream'),
+                    'size': body.get('size', 0),
+                    'content_disposition': headers.get('content-disposition', ''),
+                    'content_id': headers.get('content-id', ''),
+                })
+
+            for child in part.get('parts', []):
+                walk(child)
+
+        walk(payload)
+        return attachments
     
-    async def send_email(self, recipient_id: str, subject: str, message: str,) -> dict:
+    async def send_email(self, recipient_id: str, subject: str, message: str, attachment_paths: list[str] | None = None) -> dict:
         """Creates and sends an email message"""
         try:
             message_obj = EmailMessage()
@@ -243,8 +335,9 @@ class GmailService:
             message_obj['To'] = recipient_id
             message_obj['From'] = self.user_email
             message_obj['Subject'] = subject
+            self._add_attachments(message_obj, attachment_paths)
 
-            encoded_message = base64.urlsafe_b64encode(message_obj.as_bytes()).decode()
+            encoded_message = self._encode_message(message_obj)
             create_message = {'raw': encoded_message}
             
             send_message = await asyncio.to_thread(
@@ -253,6 +346,8 @@ class GmailService:
             logger.info(f"Message sent: {send_message['id']}")
             return {"status": "success", "message_id": send_message["id"]}
         except HttpError as error:
+            return {"status": "error", "error_message": str(error)}
+        except (FileNotFoundError, OSError, ValueError) as error:
             return {"status": "error", "error_message": str(error)}
 
     async def open_email(self, email_id: str) -> str:
@@ -296,7 +391,7 @@ class GmailService:
 
             # Decode the base64URL encoded raw content
             raw_data = msg['raw']
-            decoded_data = urlsafe_b64decode(raw_data)
+            decoded_data = self._decode_base64url(raw_data)
 
             # Parse the RFC 2822 email
             mime_message = message_from_bytes(decoded_data)
@@ -347,7 +442,7 @@ class GmailService:
         except HttpError as error:
             return f"An HttpError occurred: {str(error)}"
     
-    async def create_draft(self, recipient_id: str, subject: str, message: str) -> dict:
+    async def create_draft(self, recipient_id: str, subject: str, message: str, attachment_paths: list[str] | None = None) -> dict:
         """Creates a draft email message"""
         try:
             message_obj = EmailMessage()
@@ -356,8 +451,9 @@ class GmailService:
             message_obj['To'] = recipient_id
             message_obj['From'] = self.user_email
             message_obj['Subject'] = subject
+            self._add_attachments(message_obj, attachment_paths)
 
-            encoded_message = base64.urlsafe_b64encode(message_obj.as_bytes()).decode()
+            encoded_message = self._encode_message(message_obj)
             create_message = {'raw': encoded_message}
             
             draft = await asyncio.to_thread(
@@ -366,6 +462,8 @@ class GmailService:
             logger.info(f"Draft created: {draft['id']}")
             return {"status": "success", "draft_id": draft["id"]}
         except HttpError as error:
+            return {"status": "error", "error_message": str(error)}
+        except (FileNotFoundError, OSError, ValueError) as error:
             return {"status": "error", "error_message": str(error)}
     
     async def list_drafts(self) -> list[dict] | str:
@@ -399,6 +497,190 @@ class GmailService:
             return draft_list
         except HttpError as error:
             return f"An HttpError occurred: {str(error)}"
+
+    async def attach_files_to_draft(self, draft_id: str, attachment_paths: list[str]) -> dict:
+        """Adds local files to an existing draft while preserving its current headers and body."""
+        try:
+            draft_data = await asyncio.to_thread(
+                self.service.users().drafts().get(userId="me", id=draft_id, format="raw").execute
+            )
+            raw_data = draft_data.get('message', {}).get('raw')
+            if not raw_data:
+                raise ValueError("Draft does not contain raw message data")
+
+            message_obj = BytesParser(policy=policy.default).parsebytes(self._decode_base64url(raw_data))
+            self._add_attachments(message_obj, attachment_paths)
+
+            updated_draft = await asyncio.to_thread(
+                self.service.users().drafts().update(
+                    userId="me",
+                    id=draft_id,
+                    body={'message': {'raw': self._encode_message(message_obj)}}
+                ).execute
+            )
+            logger.info(f"Attachments added to draft: {draft_id}")
+            return {"status": "success", "draft_id": updated_draft["id"]}
+        except HttpError as error:
+            return {"status": "error", "error_message": str(error)}
+        except (FileNotFoundError, OSError, ValueError) as error:
+            return {"status": "error", "error_message": str(error)}
+
+    async def reply_to_email(self, email_id: str, message: str, attachment_paths: list[str] | None = None) -> dict:
+        """Sends a threaded reply and preserves the original conversation recipients."""
+        try:
+            original = await asyncio.to_thread(
+                self.service.users().messages().get(
+                    userId="me",
+                    id=email_id,
+                    format="metadata",
+                    metadataHeaders=["Subject", "From", "To", "Cc", "Reply-To", "Message-ID", "References"],
+                ).execute
+            )
+            headers = self._header_lookup(original.get('payload', {}).get('headers', []))
+            own_email = parseaddr(self.user_email)[1].lower()
+
+            to_addresses = [
+                address for address in getaddresses([headers.get('reply-to') or headers.get('from', '')])
+                if address[1].lower() != own_email
+            ]
+            cc_addresses = [
+                address for address in getaddresses([headers.get('to', ''), headers.get('cc', '')])
+                if address[1].lower() != own_email
+            ]
+
+            to_recipients = self._format_unique_addresses(to_addresses)
+            to_recipient_emails = {parseaddr(address)[1].lower() for address in to_recipients}
+            cc_recipients = [
+                address for address in self._format_unique_addresses(cc_addresses)
+                if parseaddr(address)[1].lower() not in to_recipient_emails
+            ]
+
+            if not to_recipients and cc_recipients:
+                to_recipients = cc_recipients
+                cc_recipients = []
+            if not to_recipients:
+                raise ValueError("Could not determine reply recipients from original email")
+
+            subject = decode_mime_header(headers.get('subject', ''))
+            if not subject.lower().startswith("re:"):
+                subject = f"Re: {subject}"
+
+            message_obj = EmailMessage()
+            message_obj.set_content(message)
+            message_obj['To'] = ", ".join(to_recipients)
+            if cc_recipients:
+                message_obj['Cc'] = ", ".join(cc_recipients)
+            message_obj['From'] = self.user_email
+            message_obj['Subject'] = subject
+
+            original_message_id = headers.get('message-id', '')
+            references = headers.get('references', '')
+            if original_message_id:
+                message_obj['In-Reply-To'] = original_message_id
+                message_obj['References'] = f"{references} {original_message_id}".strip()
+
+            self._add_attachments(message_obj, attachment_paths)
+
+            send_message = await asyncio.to_thread(
+                self.service.users().messages().send(
+                    userId="me",
+                    body={
+                        'raw': self._encode_message(message_obj),
+                        'threadId': original.get('threadId'),
+                    },
+                ).execute
+            )
+            logger.info(f"Reply sent: {send_message['id']}")
+            return {
+                "status": "success",
+                "message_id": send_message["id"],
+                "thread_id": send_message.get("threadId"),
+                "to": to_recipients,
+                "cc": cc_recipients,
+            }
+        except HttpError as error:
+            return {"status": "error", "error_message": str(error)}
+        except (FileNotFoundError, OSError, ValueError) as error:
+            return {"status": "error", "error_message": str(error)}
+
+    async def list_email_attachments(self, email_id: str) -> list[dict] | str:
+        """Lists attachment metadata for an email."""
+        try:
+            msg = await asyncio.to_thread(
+                self.service.users().messages().get(userId="me", id=email_id, format="full").execute
+            )
+            return self._attachment_parts(msg.get('payload', {}))
+        except HttpError as error:
+            return f"An HttpError occurred: {str(error)}"
+
+    async def read_email_attachments(
+        self,
+        email_id: str,
+        attachment_id: str | None = None,
+        filename: str | None = None,
+        save_dir: str | None = None,
+        max_inline_bytes: int = 100_000,
+    ) -> list[dict] | str:
+        """Reads email attachments, optionally saving decoded files to disk."""
+        try:
+            attachments = await self.list_email_attachments(email_id)
+            if isinstance(attachments, str):
+                return attachments
+
+            selected = attachments
+            if attachment_id:
+                selected = [
+                    attachment for attachment in selected
+                    if attachment['attachment_id'] == attachment_id
+                ]
+            if filename:
+                selected = [
+                    attachment for attachment in selected
+                    if attachment.get('filename') == filename
+                ]
+
+            output_dir = Path(save_dir).expanduser() if save_dir else None
+            if output_dir:
+                output_dir.mkdir(parents=True, exist_ok=True)
+
+            results = []
+            text_extensions = {'.txt', '.csv', '.json', '.xml', '.html', '.htm', '.md', '.log'}
+            for attachment in selected:
+                attachment_data = await asyncio.to_thread(
+                    self.service.users().messages().attachments().get(
+                        userId="me",
+                        messageId=email_id,
+                        id=attachment['attachment_id'],
+                    ).execute
+                )
+                content = self._decode_base64url(attachment_data.get('data', ''))
+                result = {
+                    **attachment,
+                    'size': len(content),
+                }
+
+                filename_for_disk = Path(attachment.get('filename') or f"attachment-{attachment['attachment_id']}").name
+                if output_dir:
+                    saved_path = output_dir / filename_for_disk
+                    saved_path.write_bytes(content)
+                    result['saved_path'] = str(saved_path)
+
+                mime_type = attachment.get('mime_type', '')
+                extension = Path(filename_for_disk).suffix.lower()
+                if len(content) <= max_inline_bytes and (mime_type.startswith('text/') or extension in text_extensions):
+                    result['content'] = content.decode('utf-8', errors='replace')
+                elif len(content) <= max_inline_bytes:
+                    result['content_base64'] = base64.b64encode(content).decode()
+                else:
+                    result['content_omitted'] = f"Attachment exceeds max_inline_bytes ({max_inline_bytes}). Use save_dir to write it to disk."
+
+                results.append(result)
+
+            return results
+        except HttpError as error:
+            return f"An HttpError occurred: {str(error)}"
+        except (OSError, ValueError) as error:
+            return f"An error occurred: {str(error)}"
     
     async def list_labels(self) -> list[dict] | str:
         """Lists all labels in the user's mailbox"""
@@ -1207,8 +1489,41 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                             "type": "string",
                             "description": "Email content text",
                         },
+                        "attachment_paths": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Optional local file paths to attach",
+                        },
                     },
                     "required": ["recipient_id", "subject", "message"],
+                },
+            ),
+            types.Tool(
+                name="reply-to-email",
+                description="""Sends a threaded reply to an email, preserving the original recipients.
+                Do not use unless the user has approved sending the reply.""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "email_id": {
+                            "type": "string",
+                            "description": "Email ID to reply to",
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "Reply content text",
+                        },
+                        "attachment_paths": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Optional local file paths to attach to the reply",
+                        },
+                    },
+                    "required": ["email_id", "message"],
                 },
             ),
             types.Tool(
@@ -1244,6 +1559,50 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                         "email_id": {
                             "type": "string",
                             "description": "Email ID",
+                        },
+                    },
+                    "required": ["email_id"],
+                },
+            ),
+            types.Tool(
+                name="list-email-attachments",
+                description="Lists attachments on an email",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "email_id": {
+                            "type": "string",
+                            "description": "Email ID",
+                        },
+                    },
+                    "required": ["email_id"],
+                },
+            ),
+            types.Tool(
+                name="read-email-attachments",
+                description="Reads email attachments, optionally saving decoded files to a local directory",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "email_id": {
+                            "type": "string",
+                            "description": "Email ID",
+                        },
+                        "attachment_id": {
+                            "type": "string",
+                            "description": "Optional attachment ID to read. If omitted, all attachments are read.",
+                        },
+                        "filename": {
+                            "type": "string",
+                            "description": "Optional filename to read. If omitted, all matching attachments are read.",
+                        },
+                        "save_dir": {
+                            "type": "string",
+                            "description": "Optional local directory where attachments should be saved",
+                        },
+                        "max_inline_bytes": {
+                            "type": "integer",
+                            "description": "Maximum attachment size to include inline in the tool response",
                         },
                     },
                     "required": ["email_id"],
@@ -1295,6 +1654,13 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                             "type": "string",
                             "description": "Email content text",
                         },
+                        "attachment_paths": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Optional local file paths to attach to the draft",
+                        },
                     },
                     "required": ["recipient_id", "subject", "message"],
                 },
@@ -1306,6 +1672,27 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                     "type": "object",
                     "properties": {},
                     "required": []
+                },
+            ),
+            types.Tool(
+                name="attach-files-to-draft",
+                description="Attaches local files to an existing draft",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "draft_id": {
+                            "type": "string",
+                            "description": "Draft ID",
+                        },
+                        "attachment_paths": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Local file paths to attach",
+                        },
+                    },
+                    "required": ["draft_id", "attachment_paths"],
                 },
             ),
             types.Tool(
@@ -1653,14 +2040,34 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                 message_content = '\n'.join(email_lines[1:]).strip()
             else:
                 message_content = message
-                
-            send_response = await gmail_service.send_email(recipient, subject, message_content)
+
+            attachment_paths = arguments.get("attachment_paths")
+            send_response = await gmail_service.send_email(recipient, subject, message_content, attachment_paths)
             
             if send_response["status"] == "success":
                 response_text = f"Email sent successfully. Message ID: {send_response['message_id']}"
             else:
                 response_text = f"Failed to send email: {send_response['error_message']}"
             return [types.TextContent(type="text", text=response_text)]
+
+        if name == "reply-to-email":
+            email_id = arguments.get("email_id")
+            if not email_id:
+                raise ValueError("Missing email ID parameter")
+            message = arguments.get("message")
+            if not message:
+                raise ValueError("Missing message parameter")
+
+            attachment_paths = arguments.get("attachment_paths")
+            reply_response = await gmail_service.reply_to_email(email_id, message, attachment_paths)
+            if reply_response["status"] == "success":
+                response_text = (
+                    f"Reply sent successfully. Message ID: {reply_response['message_id']}, "
+                    f"Thread ID: {reply_response['thread_id']}"
+                )
+            else:
+                response_text = f"Failed to send reply: {reply_response['error_message']}"
+            return [types.TextContent(type="text", text=response_text, artifact={"type": "json", "data": reply_response})]
 
         if name == "get-unread-emails":
                 
@@ -1674,6 +2081,26 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                 
             retrieved_email = await gmail_service.read_email(email_id)
             return [types.TextContent(type="text", text=str(retrieved_email),artifact={"type": "dictionary", "data": retrieved_email} )]
+        if name == "list-email-attachments":
+            email_id = arguments.get("email_id")
+            if not email_id:
+                raise ValueError("Missing email ID parameter")
+
+            attachments = await gmail_service.list_email_attachments(email_id)
+            return [types.TextContent(type="text", text=str(attachments), artifact={"type": "json", "data": attachments})]
+        if name == "read-email-attachments":
+            email_id = arguments.get("email_id")
+            if not email_id:
+                raise ValueError("Missing email ID parameter")
+
+            attachments = await gmail_service.read_email_attachments(
+                email_id=email_id,
+                attachment_id=arguments.get("attachment_id"),
+                filename=arguments.get("filename"),
+                save_dir=arguments.get("save_dir"),
+                max_inline_bytes=arguments.get("max_inline_bytes", 100_000),
+            )
+            return [types.TextContent(type="text", text=str(attachments), artifact={"type": "json", "data": attachments})]
         if name == "open-email":
             email_id = arguments.get("email_id")
             if not email_id:
@@ -1701,7 +2128,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             message = arguments.get("message")
             if not recipient_id or not subject or not message:
                 raise ValueError("Missing required parameters for creating a draft")
-            draft_response = await gmail_service.create_draft(recipient_id, subject, message)
+            draft_response = await gmail_service.create_draft(recipient_id, subject, message, arguments.get("attachment_paths"))
             if draft_response["status"] == "success":
                 response_text = f"Draft created successfully. Draft ID: {draft_response['draft_id']}"
             else:
@@ -1710,6 +2137,17 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
         elif name == "list-drafts":
             drafts = await gmail_service.list_drafts()
             return [types.TextContent(type="text", text=str(drafts), artifact={"type": "json", "data": drafts})]
+        elif name == "attach-files-to-draft":
+            draft_id = arguments.get("draft_id")
+            attachment_paths = arguments.get("attachment_paths")
+            if not draft_id or not attachment_paths:
+                raise ValueError("Missing required parameters for attaching files to a draft")
+            draft_response = await gmail_service.attach_files_to_draft(draft_id, attachment_paths)
+            if draft_response["status"] == "success":
+                response_text = f"Files attached successfully. Draft ID: {draft_response['draft_id']}"
+            else:
+                response_text = f"Failed to attach files to draft: {draft_response['error_message']}"
+            return [types.TextContent(type="text", text=response_text)]
         elif name == "list-labels":
             labels = await gmail_service.list_labels()
             return [types.TextContent(type="text", text=str(labels), artifact={"type": "json", "data": labels})]

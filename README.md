@@ -6,13 +6,18 @@ A powerful and feature-rich Model Context Protocol (MCP) server for Gmail integr
 
 ### 📧 Complete Email Management
 - Send emails with customizable subject, content, and recipients
+- Send emails with local file attachments
+- Reply to email threads while preserving the original recipients
 - Read and retrieve email content with full metadata
+- List and read email attachments, with optional saving to disk
 - Move emails to trash with confirmation
 - Mark emails as read/unread
 - Open emails directly in browser
 
 ### 📝 Draft Management
 - Create draft emails for later review
+- Create drafts with local file attachments
+- Attach local files to existing drafts
 - List all draft emails
 - Edit existing drafts
 
