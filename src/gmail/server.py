@@ -283,6 +283,9 @@ class GmailService:
         formatted = GmailService._format_unique_addresses(getaddresses(addresses))
         return ", ".join(formatted) if formatted else None
 
+    def _from_header(self, from_email: str | None) -> str:
+        return self._format_address_header(from_email) or self.user_email
+
     @staticmethod
     def _attachment_paths(attachment_paths: list[str] | str | None) -> list[Path]:
         if not attachment_paths:
@@ -403,6 +406,7 @@ class GmailService:
         attachment_paths: list[str] | None = None,
         cc: list[str] | str | None = None,
         attachments: list[dict] | None = None,
+        from_email: str | None = None,
     ) -> dict:
         """Creates and sends an email message"""
         try:
@@ -413,7 +417,7 @@ class GmailService:
             cc_header = self._format_address_header(cc)
             if cc_header:
                 message_obj['Cc'] = cc_header
-            message_obj['From'] = self.user_email
+            message_obj['From'] = self._from_header(from_email)
             message_obj['Subject'] = subject
             self._add_all_attachments(message_obj, attachment_paths, attachments)
 
@@ -530,6 +534,7 @@ class GmailService:
         attachment_paths: list[str] | None = None,
         cc: list[str] | str | None = None,
         attachments: list[dict] | None = None,
+        from_email: str | None = None,
     ) -> dict:
         """Creates a draft email message"""
         try:
@@ -540,7 +545,7 @@ class GmailService:
             cc_header = self._format_address_header(cc)
             if cc_header:
                 message_obj['Cc'] = cc_header
-            message_obj['From'] = self.user_email
+            message_obj['From'] = self._from_header(from_email)
             message_obj['Subject'] = subject
             self._add_all_attachments(message_obj, attachment_paths, attachments)
 
@@ -579,12 +584,14 @@ class GmailService:
                 subject = next((header['value'] for header in headers if header['name'].lower() == 'subject'), 'No Subject')
                 to = next((header['value'] for header in headers if header['name'].lower() == 'to'), 'No Recipient')
                 cc = next((header['value'] for header in headers if header['name'].lower() == 'cc'), '')
+                sender = next((header['value'] for header in headers if header['name'].lower() == 'from'), '')
                 
                 draft_list.append({
                     'id': draft_id,
                     'subject': subject,
                     'to': to,
-                    'cc': cc
+                    'cc': cc,
+                    'from': sender
                 })
                 
             return draft_list
@@ -628,6 +635,7 @@ class GmailService:
         attachment_paths: list[str] | None = None,
         cc: list[str] | str | None = None,
         attachments: list[dict] | None = None,
+        from_email: str | None = None,
     ) -> dict:
         """Sends a threaded reply and preserves the original conversation recipients."""
         try:
@@ -683,7 +691,7 @@ class GmailService:
             message_obj['To'] = ", ".join(to_recipients)
             if cc_recipients:
                 message_obj['Cc'] = ", ".join(cc_recipients)
-            message_obj['From'] = self.user_email
+            message_obj['From'] = self._from_header(from_email)
             message_obj['Subject'] = subject
 
             original_message_id = headers.get('message-id', '')
@@ -1601,6 +1609,10 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                             },
                             "description": "Optional Cc recipient email addresses",
                         },
+                        "from_email": {
+                            "type": "string",
+                            "description": "Optional sender email address. Must be configured as a Gmail send-as alias for the authenticated account.",
+                        },
                         "subject": {
                             "type": "string",
                             "description": "Email subject",
@@ -1667,6 +1679,10 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                                 "type": "string"
                             },
                             "description": "Optional additional Cc recipient email addresses",
+                        },
+                        "from_email": {
+                            "type": "string",
+                            "description": "Optional sender email address. Must be configured as a Gmail send-as alias for the authenticated account.",
                         },
                         "attachment_paths": {
                             "type": "array",
@@ -1831,6 +1847,10 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                                 "type": "string"
                             },
                             "description": "Optional Cc recipient email addresses",
+                        },
+                        "from_email": {
+                            "type": "string",
+                            "description": "Optional sender email address. Must be configured as a Gmail send-as alias for the authenticated account.",
                         },
                         "subject": {
                             "type": "string",
@@ -2281,6 +2301,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
 
             attachment_paths = arguments.get("attachment_paths")
             cc = arguments.get("cc") or arguments.get("cc_emails")
+            from_email = arguments.get("from_email") or arguments.get("sender_email")
             send_response = await gmail_service.send_email(
                 recipient,
                 subject,
@@ -2288,6 +2309,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                 attachment_paths,
                 cc,
                 arguments.get("attachments"),
+                from_email,
             )
             
             if send_response["status"] == "success":
@@ -2306,12 +2328,14 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
 
             attachment_paths = arguments.get("attachment_paths")
             cc = arguments.get("cc") or arguments.get("cc_emails")
+            from_email = arguments.get("from_email") or arguments.get("sender_email")
             reply_response = await gmail_service.reply_to_email(
                 email_id,
                 message,
                 attachment_paths,
                 cc,
                 arguments.get("attachments"),
+                from_email,
             )
             if reply_response["status"] == "success":
                 response_text = (
@@ -2382,6 +2406,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             if not recipient_id or not subject or not message:
                 raise ValueError("Missing required parameters for creating a draft")
             cc = arguments.get("cc") or arguments.get("cc_emails")
+            from_email = arguments.get("from_email") or arguments.get("sender_email")
             draft_response = await gmail_service.create_draft(
                 recipient_id,
                 subject,
@@ -2389,6 +2414,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                 arguments.get("attachment_paths"),
                 cc,
                 arguments.get("attachments"),
+                from_email,
             )
             if draft_response["status"] == "success":
                 response_text = f"Draft created successfully. Draft ID: {draft_response['draft_id']}"
