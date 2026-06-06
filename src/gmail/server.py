@@ -275,6 +275,15 @@ class GmailService:
         return formatted
 
     @staticmethod
+    def _format_address_header(addresses: list[str] | str | None) -> str | None:
+        if not addresses:
+            return None
+        if isinstance(addresses, str):
+            addresses = [addresses]
+        formatted = GmailService._format_unique_addresses(getaddresses(addresses))
+        return ", ".join(formatted) if formatted else None
+
+    @staticmethod
     def _attachment_paths(attachment_paths: list[str] | str | None) -> list[Path]:
         if not attachment_paths:
             return []
@@ -299,6 +308,66 @@ class GmailService:
                 subtype=subtype,
                 filename=path.name,
             )
+
+    @staticmethod
+    def _attachment_payloads(attachments: list[dict] | None) -> list[dict]:
+        if not attachments:
+            return []
+        if not isinstance(attachments, list):
+            raise ValueError("attachments must be a list")
+
+        payloads = []
+        for index, attachment in enumerate(attachments, start=1):
+            if not isinstance(attachment, dict):
+                raise ValueError(f"Attachment #{index} must be an object")
+
+            filename = attachment.get("filename")
+            if not filename:
+                raise ValueError(f"Attachment #{index} is missing filename")
+
+            if attachment.get("content_base64"):
+                encoded = attachment["content_base64"]
+                if "," in encoded and encoded.lstrip().startswith("data:"):
+                    encoded = encoded.split(",", 1)[1]
+                try:
+                    content = base64.b64decode(encoded)
+                except Exception as error:
+                    raise ValueError(f"Attachment #{index} has invalid content_base64") from error
+            elif attachment.get("content") is not None:
+                content = str(attachment["content"]).encode("utf-8")
+            else:
+                raise ValueError(f"Attachment #{index} must include content_base64 or content")
+
+            mime_type = attachment.get("mime_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            if "/" not in mime_type:
+                mime_type = "application/octet-stream"
+            maintype, subtype = mime_type.split("/", 1)
+            payloads.append({
+                "filename": Path(filename).name,
+                "content": content,
+                "maintype": maintype,
+                "subtype": subtype,
+            })
+
+        return payloads
+
+    def _add_inline_attachments(self, message_obj: EmailMessage, attachments: list[dict] | None) -> None:
+        for attachment in self._attachment_payloads(attachments):
+            message_obj.add_attachment(
+                attachment["content"],
+                maintype=attachment["maintype"],
+                subtype=attachment["subtype"],
+                filename=attachment["filename"],
+            )
+
+    def _add_all_attachments(
+        self,
+        message_obj: EmailMessage,
+        attachment_paths: list[str] | str | None = None,
+        attachments: list[dict] | None = None,
+    ) -> None:
+        self._add_attachments(message_obj, attachment_paths)
+        self._add_inline_attachments(message_obj, attachments)
 
     @staticmethod
     def _attachment_parts(payload: dict) -> list[dict]:
@@ -326,16 +395,27 @@ class GmailService:
         walk(payload)
         return attachments
     
-    async def send_email(self, recipient_id: str, subject: str, message: str, attachment_paths: list[str] | None = None) -> dict:
+    async def send_email(
+        self,
+        recipient_id: str,
+        subject: str,
+        message: str,
+        attachment_paths: list[str] | None = None,
+        cc: list[str] | str | None = None,
+        attachments: list[dict] | None = None,
+    ) -> dict:
         """Creates and sends an email message"""
         try:
             message_obj = EmailMessage()
             message_obj.set_content(message)
             
             message_obj['To'] = recipient_id
+            cc_header = self._format_address_header(cc)
+            if cc_header:
+                message_obj['Cc'] = cc_header
             message_obj['From'] = self.user_email
             message_obj['Subject'] = subject
-            self._add_attachments(message_obj, attachment_paths)
+            self._add_all_attachments(message_obj, attachment_paths, attachments)
 
             encoded_message = self._encode_message(message_obj)
             create_message = {'raw': encoded_message}
@@ -442,16 +522,27 @@ class GmailService:
         except HttpError as error:
             return f"An HttpError occurred: {str(error)}"
     
-    async def create_draft(self, recipient_id: str, subject: str, message: str, attachment_paths: list[str] | None = None) -> dict:
+    async def create_draft(
+        self,
+        recipient_id: str,
+        subject: str,
+        message: str,
+        attachment_paths: list[str] | None = None,
+        cc: list[str] | str | None = None,
+        attachments: list[dict] | None = None,
+    ) -> dict:
         """Creates a draft email message"""
         try:
             message_obj = EmailMessage()
             message_obj.set_content(message)
             
             message_obj['To'] = recipient_id
+            cc_header = self._format_address_header(cc)
+            if cc_header:
+                message_obj['Cc'] = cc_header
             message_obj['From'] = self.user_email
             message_obj['Subject'] = subject
-            self._add_attachments(message_obj, attachment_paths)
+            self._add_all_attachments(message_obj, attachment_paths, attachments)
 
             encoded_message = self._encode_message(message_obj)
             create_message = {'raw': encoded_message}
@@ -487,20 +578,25 @@ class GmailService:
                 
                 subject = next((header['value'] for header in headers if header['name'].lower() == 'subject'), 'No Subject')
                 to = next((header['value'] for header in headers if header['name'].lower() == 'to'), 'No Recipient')
+                cc = next((header['value'] for header in headers if header['name'].lower() == 'cc'), '')
                 
                 draft_list.append({
                     'id': draft_id,
                     'subject': subject,
-                    'to': to
+                    'to': to,
+                    'cc': cc
                 })
                 
             return draft_list
         except HttpError as error:
             return f"An HttpError occurred: {str(error)}"
 
-    async def attach_files_to_draft(self, draft_id: str, attachment_paths: list[str]) -> dict:
+    async def attach_files_to_draft(self, draft_id: str, attachment_paths: list[str] | None = None, attachments: list[dict] | None = None) -> dict:
         """Adds local files to an existing draft while preserving its current headers and body."""
         try:
+            if not attachment_paths and not attachments:
+                raise ValueError("Provide attachment_paths or attachments")
+
             draft_data = await asyncio.to_thread(
                 self.service.users().drafts().get(userId="me", id=draft_id, format="raw").execute
             )
@@ -509,7 +605,7 @@ class GmailService:
                 raise ValueError("Draft does not contain raw message data")
 
             message_obj = BytesParser(policy=policy.default).parsebytes(self._decode_base64url(raw_data))
-            self._add_attachments(message_obj, attachment_paths)
+            self._add_all_attachments(message_obj, attachment_paths, attachments)
 
             updated_draft = await asyncio.to_thread(
                 self.service.users().drafts().update(
@@ -525,7 +621,14 @@ class GmailService:
         except (FileNotFoundError, OSError, ValueError) as error:
             return {"status": "error", "error_message": str(error)}
 
-    async def reply_to_email(self, email_id: str, message: str, attachment_paths: list[str] | None = None) -> dict:
+    async def reply_to_email(
+        self,
+        email_id: str,
+        message: str,
+        attachment_paths: list[str] | None = None,
+        cc: list[str] | str | None = None,
+        attachments: list[dict] | None = None,
+    ) -> dict:
         """Sends a threaded reply and preserves the original conversation recipients."""
         try:
             original = await asyncio.to_thread(
@@ -554,6 +657,16 @@ class GmailService:
                 address for address in self._format_unique_addresses(cc_addresses)
                 if parseaddr(address)[1].lower() not in to_recipient_emails
             ]
+            extra_cc_addresses = getaddresses(cc if isinstance(cc, list) else [cc] if cc else [])
+            extra_cc_recipients = [
+                address for address in self._format_unique_addresses(extra_cc_addresses)
+                if parseaddr(address)[1].lower() not in to_recipient_emails
+            ]
+            cc_recipient_emails = {parseaddr(address)[1].lower() for address in cc_recipients}
+            cc_recipients.extend(
+                address for address in extra_cc_recipients
+                if parseaddr(address)[1].lower() not in cc_recipient_emails
+            )
 
             if not to_recipients and cc_recipients:
                 to_recipients = cc_recipients
@@ -579,7 +692,7 @@ class GmailService:
                 message_obj['In-Reply-To'] = original_message_id
                 message_obj['References'] = f"{references} {original_message_id}".strip()
 
-            self._add_attachments(message_obj, attachment_paths)
+            self._add_all_attachments(message_obj, attachment_paths, attachments)
 
             send_message = await asyncio.to_thread(
                 self.service.users().messages().send(
@@ -1481,6 +1594,13 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                             "type": "string",
                             "description": "Recipient email address",
                         },
+                        "cc": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Optional Cc recipient email addresses",
+                        },
                         "subject": {
                             "type": "string",
                             "description": "Email subject",
@@ -1495,6 +1615,32 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                                 "type": "string"
                             },
                             "description": "Optional local file paths to attach",
+                        },
+                        "attachments": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "filename": {
+                                        "type": "string",
+                                        "description": "Attachment filename",
+                                    },
+                                    "mime_type": {
+                                        "type": "string",
+                                        "description": "Attachment MIME type, e.g. application/pdf",
+                                    },
+                                    "content_base64": {
+                                        "type": "string",
+                                        "description": "Base64-encoded attachment bytes",
+                                    },
+                                    "content": {
+                                        "type": "string",
+                                        "description": "Text attachment content; use content_base64 for binary files",
+                                    },
+                                },
+                                "required": ["filename"],
+                            },
+                            "description": "Optional inline attachments when files are not reachable by path",
                         },
                     },
                     "required": ["recipient_id", "subject", "message"],
@@ -1515,12 +1661,45 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                             "type": "string",
                             "description": "Reply content text",
                         },
+                        "cc": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Optional additional Cc recipient email addresses",
+                        },
                         "attachment_paths": {
                             "type": "array",
                             "items": {
                                 "type": "string"
                             },
                             "description": "Optional local file paths to attach to the reply",
+                        },
+                        "attachments": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "filename": {
+                                        "type": "string",
+                                        "description": "Attachment filename",
+                                    },
+                                    "mime_type": {
+                                        "type": "string",
+                                        "description": "Attachment MIME type, e.g. application/pdf",
+                                    },
+                                    "content_base64": {
+                                        "type": "string",
+                                        "description": "Base64-encoded attachment bytes",
+                                    },
+                                    "content": {
+                                        "type": "string",
+                                        "description": "Text attachment content; use content_base64 for binary files",
+                                    },
+                                },
+                                "required": ["filename"],
+                            },
+                            "description": "Optional inline attachments when files are not reachable by path",
                         },
                     },
                     "required": ["email_id", "message"],
@@ -1646,6 +1825,13 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                             "type": "string",
                             "description": "Recipient email address",
                         },
+                        "cc": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Optional Cc recipient email addresses",
+                        },
                         "subject": {
                             "type": "string",
                             "description": "Email subject",
@@ -1660,6 +1846,32 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                                 "type": "string"
                             },
                             "description": "Optional local file paths to attach to the draft",
+                        },
+                        "attachments": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "filename": {
+                                        "type": "string",
+                                        "description": "Attachment filename",
+                                    },
+                                    "mime_type": {
+                                        "type": "string",
+                                        "description": "Attachment MIME type, e.g. application/pdf",
+                                    },
+                                    "content_base64": {
+                                        "type": "string",
+                                        "description": "Base64-encoded attachment bytes",
+                                    },
+                                    "content": {
+                                        "type": "string",
+                                        "description": "Text attachment content; use content_base64 for binary files",
+                                    },
+                                },
+                                "required": ["filename"],
+                            },
+                            "description": "Optional inline attachments when files are not reachable by path",
                         },
                     },
                     "required": ["recipient_id", "subject", "message"],
@@ -1691,8 +1903,34 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                             },
                             "description": "Local file paths to attach",
                         },
+                        "attachments": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "filename": {
+                                        "type": "string",
+                                        "description": "Attachment filename",
+                                    },
+                                    "mime_type": {
+                                        "type": "string",
+                                        "description": "Attachment MIME type, e.g. application/pdf",
+                                    },
+                                    "content_base64": {
+                                        "type": "string",
+                                        "description": "Base64-encoded attachment bytes",
+                                    },
+                                    "content": {
+                                        "type": "string",
+                                        "description": "Text attachment content; use content_base64 for binary files",
+                                    },
+                                },
+                                "required": ["filename"],
+                            },
+                            "description": "Inline attachments when files are not reachable by path",
+                        },
                     },
-                    "required": ["draft_id", "attachment_paths"],
+                    "required": ["draft_id"],
                 },
             ),
             types.Tool(
@@ -2042,7 +2280,15 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                 message_content = message
 
             attachment_paths = arguments.get("attachment_paths")
-            send_response = await gmail_service.send_email(recipient, subject, message_content, attachment_paths)
+            cc = arguments.get("cc") or arguments.get("cc_emails")
+            send_response = await gmail_service.send_email(
+                recipient,
+                subject,
+                message_content,
+                attachment_paths,
+                cc,
+                arguments.get("attachments"),
+            )
             
             if send_response["status"] == "success":
                 response_text = f"Email sent successfully. Message ID: {send_response['message_id']}"
@@ -2059,7 +2305,14 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                 raise ValueError("Missing message parameter")
 
             attachment_paths = arguments.get("attachment_paths")
-            reply_response = await gmail_service.reply_to_email(email_id, message, attachment_paths)
+            cc = arguments.get("cc") or arguments.get("cc_emails")
+            reply_response = await gmail_service.reply_to_email(
+                email_id,
+                message,
+                attachment_paths,
+                cc,
+                arguments.get("attachments"),
+            )
             if reply_response["status"] == "success":
                 response_text = (
                     f"Reply sent successfully. Message ID: {reply_response['message_id']}, "
@@ -2128,7 +2381,15 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             message = arguments.get("message")
             if not recipient_id or not subject or not message:
                 raise ValueError("Missing required parameters for creating a draft")
-            draft_response = await gmail_service.create_draft(recipient_id, subject, message, arguments.get("attachment_paths"))
+            cc = arguments.get("cc") or arguments.get("cc_emails")
+            draft_response = await gmail_service.create_draft(
+                recipient_id,
+                subject,
+                message,
+                arguments.get("attachment_paths"),
+                cc,
+                arguments.get("attachments"),
+            )
             if draft_response["status"] == "success":
                 response_text = f"Draft created successfully. Draft ID: {draft_response['draft_id']}"
             else:
@@ -2140,9 +2401,10 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
         elif name == "attach-files-to-draft":
             draft_id = arguments.get("draft_id")
             attachment_paths = arguments.get("attachment_paths")
-            if not draft_id or not attachment_paths:
+            attachments = arguments.get("attachments")
+            if not draft_id or (not attachment_paths and not attachments):
                 raise ValueError("Missing required parameters for attaching files to a draft")
-            draft_response = await gmail_service.attach_files_to_draft(draft_id, attachment_paths)
+            draft_response = await gmail_service.attach_files_to_draft(draft_id, attachment_paths, attachments)
             if draft_response["status"] == "success":
                 response_text = f"Files attached successfully. Draft ID: {draft_response['draft_id']}"
             else:

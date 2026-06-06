@@ -21,6 +21,9 @@ const CREDENTIALS_PATH =
 const USERS_FILE =
   process.env.GMAIL_MCP_USERS_FILE ||
   "/opt/gmail-mcp/secrets/users.json";
+const CLIENTS_FILE =
+  process.env.GMAIL_MCP_CLIENTS_FILE ||
+  "/opt/gmail-mcp/secrets/oauth-clients.json";
 const USER_TOKENS_DIR =
   process.env.GMAIL_MCP_USER_TOKENS_DIR ||
   "/opt/gmail-mcp/secrets/users";
@@ -35,11 +38,13 @@ const SCOPES = (process.env.GOOGLE_OAUTH_SCOPES ||
   "https://www.googleapis.com/auth/gmail.modify")
   .split(/[,\s]+/)
   .filter(Boolean);
+const MCP_SCOPES = ["gmail"];
 const REDIRECT_URI = `${BASE_URL}/auth/callback`;
 const pendingStates = new Map();
+const pendingAuthorizationCodes = new Map();
 
-function sendJson(res, status, data) {
-  res.writeHead(status, { "Content-Type": "application/json" });
+function sendJson(res, status, data, headers = {}) {
+  res.writeHead(status, { "Content-Type": "application/json", ...headers });
   res.end(JSON.stringify(data));
 }
 
@@ -96,6 +101,9 @@ function ensureStores() {
   if (!fs.existsSync(USERS_FILE)) {
     saveUsers({ users: {} });
   }
+  if (!fs.existsSync(CLIENTS_FILE)) {
+    saveClients({ clients: {} });
+  }
 }
 
 function loadUsers() {
@@ -108,6 +116,29 @@ function loadUsers() {
 
 function saveUsers(store) {
   fs.writeFileSync(USERS_FILE, JSON.stringify(store, null, 2), { mode: 0o600 });
+}
+
+function loadClients() {
+  try {
+    return JSON.parse(fs.readFileSync(CLIENTS_FILE, "utf8"));
+  } catch {
+    return { clients: {} };
+  }
+}
+
+function saveClients(store) {
+  fs.writeFileSync(CLIENTS_FILE, JSON.stringify(store, null, 2), { mode: 0o600 });
+}
+
+function findClient(clientId) {
+  return loadClients().clients[clientId] || null;
+}
+
+function upsertClient(client) {
+  const store = loadClients();
+  store.clients[client.client_id] = client;
+  saveClients(store);
+  return client;
 }
 
 function loadGoogleClient() {
@@ -159,6 +190,83 @@ function extractApiKey(req) {
   const auth = req.headers.authorization;
   if (!auth?.startsWith("Bearer ")) return null;
   return auth.slice(7);
+}
+
+function oauthProtectedResourceMetadata() {
+  return {
+    resource: `${BASE_URL}/mcp`,
+    authorization_servers: [BASE_URL],
+    scopes_supported: MCP_SCOPES,
+    bearer_methods_supported: ["header"],
+  };
+}
+
+function oauthAuthorizationServerMetadata() {
+  return {
+    issuer: BASE_URL,
+    authorization_endpoint: `${BASE_URL}/authorize`,
+    token_endpoint: `${BASE_URL}/token`,
+    registration_endpoint: `${BASE_URL}/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code"],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none"],
+    scopes_supported: MCP_SCOPES,
+  };
+}
+
+function verifyPkce(codeVerifier, codeChallenge) {
+  const digest = crypto
+    .createHash("sha256")
+    .update(codeVerifier)
+    .digest("base64url");
+  if (digest.length !== codeChallenge.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(codeChallenge));
+}
+
+function appendParams(uri, params) {
+  const redirect = new URL(uri);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) {
+      redirect.searchParams.set(key, value);
+    }
+  }
+  return redirect.toString();
+}
+
+function redirectOAuthError(res, redirectUri, state, error, description) {
+  res.writeHead(302, {
+    Location: appendParams(redirectUri, {
+      error,
+      error_description: description,
+      state,
+    }),
+  });
+  res.end();
+}
+
+function parseRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString();
+      if (!raw) {
+        resolve({});
+        return;
+      }
+      try {
+        if (req.headers["content-type"]?.includes("application/json")) {
+          resolve(JSON.parse(raw));
+        } else {
+          resolve(Object.fromEntries(new URLSearchParams(raw)));
+        }
+      } catch (error) {
+        reject(error);
+      }
+    });
+    req.on("error", reject);
+  });
 }
 
 async function exchangeCodeForToken(code) {
@@ -269,6 +377,8 @@ async function handleMcpRequest(req, res) {
         message: `Unauthorized. Visit ${BASE_URL}/auth to connect Gmail.`,
       },
       id: null,
+    }, {
+      "WWW-Authenticate": `Bearer resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource/mcp"`,
     });
     return;
   }
@@ -335,10 +445,120 @@ function renderClientConfig(apiKey) {
   );
 }
 
-async function startAuth(res) {
+async function handleClientRegistration(req, res) {
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "method_not_allowed" });
+    return;
+  }
+
+  const body = await parseRequestBody(req);
+  const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
+  if (redirectUris.length === 0) {
+    sendJson(res, 400, { error: "invalid_client_metadata", error_description: "redirect_uris is required" });
+    return;
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const client = upsertClient({
+    client_id: `client-${crypto.randomBytes(24).toString("hex")}`,
+    client_name: body.client_name || "Claude MCP Client",
+    redirect_uris: redirectUris,
+    grant_types: ["authorization_code"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "none",
+    created_at: Date.now(),
+  });
+
+  sendJson(res, 201, {
+    client_id: client.client_id,
+    client_id_issued_at: now,
+    client_name: client.client_name,
+    redirect_uris: client.redirect_uris,
+    grant_types: client.grant_types,
+    response_types: client.response_types,
+    token_endpoint_auth_method: client.token_endpoint_auth_method,
+  });
+}
+
+async function handleAuthorize(url, res) {
+  const responseType = url.searchParams.get("response_type");
+  const clientId = url.searchParams.get("client_id");
+  const redirectUri = url.searchParams.get("redirect_uri");
+  const state = url.searchParams.get("state");
+  const codeChallenge = url.searchParams.get("code_challenge");
+  const codeChallengeMethod = url.searchParams.get("code_challenge_method");
+  const scope = url.searchParams.get("scope") || MCP_SCOPES.join(" ");
+
+  if (responseType !== "code") {
+    sendHtml(res, 400, pageShell("Invalid Request", "<h1>Invalid Request</h1><p>Only response_type=code is supported.</p>"));
+    return;
+  }
+
+  const client = clientId ? findClient(clientId) : null;
+  if (!client || !redirectUri || !client.redirect_uris.includes(redirectUri)) {
+    sendHtml(res, 400, pageShell("Invalid Client", "<h1>Invalid Client</h1><p>The OAuth client is not registered for this redirect URI.</p>"));
+    return;
+  }
+
+  if (!codeChallenge || codeChallengeMethod !== "S256") {
+    redirectOAuthError(res, redirectUri, state, "invalid_request", "PKCE S256 is required");
+    return;
+  }
+
+  const googleState = crypto.randomBytes(20).toString("hex");
+  pendingStates.set(googleState, {
+    createdAt: Date.now(),
+    mode: "oauth",
+    clientId,
+    redirectUri,
+    clientState: state,
+    codeChallenge,
+    scope,
+  });
+
+  await startGoogleAuth(res, googleState);
+}
+
+async function handleToken(req, res) {
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "method_not_allowed" });
+    return;
+  }
+
+  const body = await parseRequestBody(req);
+  if (body.grant_type !== "authorization_code") {
+    sendJson(res, 400, { error: "unsupported_grant_type" });
+    return;
+  }
+
+  const authorization = pendingAuthorizationCodes.get(body.code);
+  pendingAuthorizationCodes.delete(body.code);
+  if (!authorization || Date.now() - authorization.createdAt > 5 * 60 * 1000) {
+    sendJson(res, 400, { error: "invalid_grant" });
+    return;
+  }
+  if (authorization.clientId !== body.client_id || authorization.redirectUri !== body.redirect_uri) {
+    sendJson(res, 400, { error: "invalid_grant" });
+    return;
+  }
+  if (!body.code_verifier || !verifyPkce(body.code_verifier, authorization.codeChallenge)) {
+    sendJson(res, 400, { error: "invalid_grant", error_description: "Invalid PKCE verifier" });
+    return;
+  }
+
+  sendJson(res, 200, {
+    access_token: authorization.apiKey,
+    token_type: "Bearer",
+    expires_in: 2592000,
+    scope: authorization.scope || MCP_SCOPES.join(" "),
+  }, {
+    "Cache-Control": "no-store",
+    Pragma: "no-cache",
+  });
+}
+
+async function startGoogleAuth(res, state) {
   const google = loadGoogleClient();
-  const state = crypto.randomBytes(20).toString("hex");
-  pendingStates.set(state, { createdAt: Date.now() });
   const params = new URLSearchParams({
     client_id: google.clientId,
     redirect_uri: REDIRECT_URI,
@@ -354,10 +574,17 @@ async function startAuth(res) {
   res.end();
 }
 
+async function startAuth(res) {
+  const state = crypto.randomBytes(20).toString("hex");
+  pendingStates.set(state, { createdAt: Date.now(), mode: "manual" });
+  await startGoogleAuth(res, state);
+}
+
 async function handleAuthCallback(url, res) {
   const state = url.searchParams.get("state");
   const code = url.searchParams.get("code");
-  if (!state || !pendingStates.has(state)) {
+  const pending = state ? pendingStates.get(state) : null;
+  if (!pending) {
     sendHtml(res, 400, pageShell("Invalid State", "<h1>Invalid State</h1><p>Session expired. <a href='/auth'>Try again</a>.</p>"));
     return;
   }
@@ -388,6 +615,26 @@ async function handleAuthCallback(url, res) {
   };
   upsertUser(user);
 
+  if (pending.mode === "oauth") {
+    const authorizationCode = crypto.randomBytes(32).toString("hex");
+    pendingAuthorizationCodes.set(authorizationCode, {
+      createdAt: Date.now(),
+      clientId: pending.clientId,
+      redirectUri: pending.redirectUri,
+      codeChallenge: pending.codeChallenge,
+      scope: pending.scope,
+      apiKey,
+    });
+    res.writeHead(302, {
+      Location: appendParams(pending.redirectUri, {
+        code: authorizationCode,
+        state: pending.clientState,
+      }),
+    });
+    res.end();
+    return;
+  }
+
   sendHtml(
     res,
     200,
@@ -411,6 +658,9 @@ setInterval(() => {
   for (const [state, data] of pendingStates) {
     if (now - data.createdAt > 10 * 60 * 1000) pendingStates.delete(state);
   }
+  for (const [code, data] of pendingAuthorizationCodes) {
+    if (now - data.createdAt > 5 * 60 * 1000) pendingAuthorizationCodes.delete(code);
+  }
 }, 10 * 60 * 1000);
 
 ensureStores();
@@ -419,6 +669,26 @@ const httpServer = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://localhost:${PORT}`);
 
   try {
+    if (
+      url.pathname === "/.well-known/oauth-protected-resource" ||
+      url.pathname === "/.well-known/oauth-protected-resource/mcp"
+    ) {
+      sendJson(res, 200, oauthProtectedResourceMetadata(), {
+        "Cache-Control": "public, max-age=300",
+      });
+      return;
+    }
+
+    if (
+      url.pathname === "/.well-known/oauth-authorization-server" ||
+      url.pathname === "/.well-known/oauth-authorization-server/mcp"
+    ) {
+      sendJson(res, 200, oauthAuthorizationServerMetadata(), {
+        "Cache-Control": "public, max-age=300",
+      });
+      return;
+    }
+
     if (url.pathname === "/health") {
       const users = loadUsers();
       sendJson(res, 200, {
@@ -426,9 +696,25 @@ const httpServer = http.createServer(async (req, res) => {
         service: "gmail-mcp-remote",
         mcp: `${BASE_URL}/mcp`,
         auth: `${BASE_URL}/auth`,
+        authorization_server: BASE_URL,
         user_count: Object.keys(users.users).length,
         legacy_enabled: Boolean(LEGACY_API_KEY && fs.existsSync(LEGACY_TOKEN_PATH)),
       });
+      return;
+    }
+
+    if (url.pathname === "/register") {
+      await handleClientRegistration(req, res);
+      return;
+    }
+
+    if (url.pathname === "/authorize" && req.method === "GET") {
+      await handleAuthorize(url, res);
+      return;
+    }
+
+    if (url.pathname === "/token") {
+      await handleToken(req, res);
       return;
     }
 
