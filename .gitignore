@@ -9,3 +9,13 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Node dependencies
+node_modules/
+
+# Local Gmail OAuth files
+credentials.json
+tokens.json
+*.credentials.json
+*.tokens.json
+.gmail-mcp/
