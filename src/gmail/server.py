@@ -628,6 +628,17 @@ class GmailService:
         except (FileNotFoundError, OSError, ValueError) as error:
             return {"status": "error", "error_message": str(error)}
 
+    async def delete_draft(self, draft_id: str) -> str:
+        """Permanently deletes a Gmail draft by draft ID."""
+        try:
+            await asyncio.to_thread(
+                self.service.users().drafts().delete(userId="me", id=draft_id).execute
+            )
+            logger.info(f"Draft deleted: {draft_id}")
+            return "Draft deleted successfully."
+        except HttpError as error:
+            return f"An HttpError occurred: {str(error)}"
+
     async def reply_to_email(
         self,
         email_id: str,
@@ -1954,6 +1965,20 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                 },
             ),
             types.Tool(
+                name="delete-draft",
+                description="Permanently deletes an existing draft by draft ID",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "draft_id": {
+                            "type": "string",
+                            "description": "Draft ID to delete",
+                        },
+                    },
+                    "required": ["draft_id"],
+                },
+            ),
+            types.Tool(
                 name="list-labels",
                 description="Lists all labels in the user's mailbox",
                 inputSchema={
@@ -2436,6 +2461,12 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             else:
                 response_text = f"Failed to attach files to draft: {draft_response['error_message']}"
             return [types.TextContent(type="text", text=response_text)]
+        elif name == "delete-draft":
+            draft_id = arguments.get("draft_id")
+            if not draft_id:
+                raise ValueError("Missing required parameter for deleting a draft")
+            msg = await gmail_service.delete_draft(draft_id)
+            return [types.TextContent(type="text", text=str(msg))]
         elif name == "list-labels":
             labels = await gmail_service.list_labels()
             return [types.TextContent(type="text", text=str(labels), artifact={"type": "json", "data": labels})]
