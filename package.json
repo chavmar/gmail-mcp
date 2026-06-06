@@ -4,8 +4,9 @@
   "description": "Remote HTTP wrapper for the Gmail MCP stdio server",
   "type": "module",
   "scripts": {
-    "start:remote": "node remote/gmail-remote.js",
-    "check:remote": "node --check remote/gmail-remote.js"
+    "start:remote": "node remote/gmail-remote-multi.js",
+    "start:remote:single-user": "node remote/gmail-remote.js",
+    "check:remote": "node --check remote/gmail-remote-multi.js && node --check remote/gmail-remote.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0"

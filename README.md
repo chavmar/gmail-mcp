@@ -21,6 +21,12 @@ A powerful and feature-rich Model Context Protocol (MCP) server for Gmail integr
 - List all draft emails
 - Edit existing drafts
 
+### 🌐 Remote Team Deployment
+- Expose the Gmail MCP over Streamable HTTP with `npm run start:remote`
+- Let each team member connect their own Gmail account at `/auth`
+- Store each user's Google token server-side and issue a personal MCP Bearer key
+- Keep the MCP endpoint protected at `/mcp`
+
 ### 🏷️ Advanced Label Management
 - List all available labels
 - Create custom labels
@@ -132,6 +138,7 @@ npx @modelcontextprotocol/inspector uv run /path/to/gmail-mcp/src/gmail/server.p
 - The server will request user confirmation before performing sensitive actions
 - Review Google Cloud Console regularly for unusual activity
 - Consider using environment variables for sensitive paths
+- For multi-user remote deployment, use a Google Web OAuth client and register `/auth/callback` as an authorized redirect URI
 
 ## 🛠️ Architecture
 
